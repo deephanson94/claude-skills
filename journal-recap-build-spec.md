@@ -3,8 +3,9 @@
 **Spec v3.** Supersedes v2 entirely. The design changed shape after measurement: the
 expensive "write-time judgment layer" (a Haiku writer emitting journal entries) is
 **deleted**, because the session transcript on disk turns out to be a near-live,
-queryable record already. What remains is a cheap interactive console plus three
-mechanical anchors. See the changelog at the bottom for what was dropped and why.
+queryable record already. What remains is a cheap interactive console plus one anchor
+file — and two optional extras that should stay unbuilt unless they earn their way in.
+See the changelog at the bottom for what was dropped and why.
 
 Everything marked **[verified]** was checked against live Claude Code docs or measured
 empirically on 2026-08-18 against Claude Code 2.1.234. Re-confirm against the version
@@ -93,32 +94,26 @@ If anything disagrees with the docs on this machine, tell me and adapt.
 
 ## Architecture
 
-Four pieces. Only the first is new work of any size.
+**Build these two. Nothing else is required for the system to work.**
 
 **1. `qqna` — the console.** A shell script on `$PATH` that resolves the live
 transcript, filters it to a seed, and launches an interactive read-only Sonnet session
 in a scratch directory to answer my questions. Takes **no arguments**.
 
-**2. `.journal/ledger.tsv` — the mechanical index.** `PostToolUse` +
-`PostToolUseFailure` command hooks append one line per tool call:
-`ts | tool | path | ok|fail`. Zero tokens. Survives crashes.
+**2. `.journal/base_sha` — the diff anchor.** One file, one line, written once per
+task. Enables the single most valuable output in the system: **files that changed but
+were never discussed.**
 
-**Be honest about its value before building it.** The transcript already records every
-tool call and its outcome, so the ledger is largely redundant — it earns its place only
-if it captures something the parent transcript does not. **Verify one thing first: do
-`PostToolUse` hooks fire for tool calls made inside subagents?** If yes, the ledger is
-the only *complete, single-file* index of a delegating run and is clearly worth it
-(see the subagent blind spot below). If no, it is a cheap crash-survival backstop and
-nothing more — keep it minimal and build no features on it.
-
-**3. `.journal/HEAD.md` — the zero-token glance.** Four lines: goal, blocked, next,
-review. Injected at `SessionStart`. Answers "where are we" without running anything.
-
-**4. `.journal/base_sha` — the diff anchor.** Enables the single most valuable output
-in the system: **files that changed but were never discussed.**
+That is the whole core: one script and one anchor file. The transcript supplies
+everything else.
 
 There is **no model-written journal**, no `LOG.md`, no Haiku writer, no emission gate.
-The transcript replaces all of it.
+
+**Two further features are specified below under "Supplementary" — a status note and a
+tool-call ledger. Do not build them as part of this task.** Each has an explicit
+trigger condition; build one only if its condition is actually met in practice, and
+only after the core is working. If in doubt, leave them unbuilt — the core does not
+depend on either.
 
 ---
 
@@ -311,7 +306,9 @@ These are the three things I would otherwise always waste questions on:
    path, a repo-relative path, or a bare basename. Compare on repo-relative form, and
    when in doubt report the file as unclaimed — a false positive costs me five seconds,
    a false negative is the failure this whole feature exists to prevent.
-3. **Failure tail** — recent `fail` rows from `ledger.tsv`.
+3. **Failure tail** — recent tool failures. Source these **from the transcript**, which
+   records failed calls alongside successful ones. (If the supplementary ledger is ever
+   built, read them from there instead — but do not make this output depend on it.)
 
 **#2 is the accuracy backstop and the highest-value output in the whole system.** A
 transcript is a self-report and inherits the agent's blind spots; anything it silently
@@ -355,37 +352,82 @@ the binding via `run-shell` and verify it actually arrives before relying on it.
 
 ---
 
-## Hooks to wire (reduced)
+## Hooks to wire — exactly one
 
-- **`SessionStart`** — command hook: stdout `HEAD.md` + `git log --oneline -5`. Stdout
-  is injected into context so the agent and I both start oriented. Wire for `startup`,
-  `resume`, and `compact` matchers (the `compact` firing re-injects HEAD after
-  compaction, which is a feature).
-  **base_sha rule:** stamp `git rev-parse HEAD > .journal/base_sha` **only if the file
-  is absent**, and only on `startup` / `clear`. A resume must never move the anchor —
-  restamping silently shrinks the unclaimed-changes list and guts the backstop.
-- **`PostToolUse` + `PostToolUseFailure`** — same ledger script, `ok`/`fail` column
-  **[verified: PostToolUse is success-only]**. Fast, non-blocking. Single-line appends
-  under PIPE_BUF are atomic; no locking.
-- **`SessionEnd`** — mechanical stamp only: append `session_end <reason>` to the ledger.
-  It fires on Ctrl+C **[verified]**, but its ~1.5s budget rules out anything heavier.
+The core needs a **single** hook, and it does one mechanical thing:
 
-That is the entire hook surface. **No `Stop` hook. No `PreCompact` hook.** Both existed
-in v2 solely to drive the deleted judgment layer.
+- **`SessionStart`** — stamp `git rev-parse HEAD > .journal/base_sha` **only if the file
+  is absent**, and only on the `startup` / `clear` matchers. It writes nothing to stdout
+  and injects nothing into context.
 
-`HEAD.md` is maintained by me (or by the main session as a normal task), not by a
-hooked model. Keep HEAD writes atomic (`mktemp` + `mv`) so it can never be appended to.
+  A resume must never move the anchor — restamping silently shrinks the
+  unclaimed-changes list and guts the backstop. This is why the anchor is stamped by a
+  hook rather than by `qqna` itself: it must record where the *session* began, not where
+  I happened to first check in.
 
-**Open problem — flag this, do not paper over it.** v2 had a model keeping HEAD fresh;
-v3 deleted that writer and put nothing in its place, so **nothing now keeps HEAD
-accurate**. A stale HEAD injected at `SessionStart` is worse than no HEAD: it is a
-confident, wrong orientation for both me and the agent.
+Also ship `scripts/journal-reset.sh` — restamps `base_sha` and archives the old one, run
+by me at real task boundaries, never automatically.
 
-Propose the mechanical alternative and let me choose: at `SessionStart`, instead of
-printing a hand-maintained file, print **the tail of the previous session's transcript**
-— its last assistant text block (truncated) plus the last few ledger rows. That is
-zero-token, always accurate, needs no writer, and cannot go stale. If that works, HEAD
-as a hand-edited file may be deleted entirely.
+**No `Stop`, no `PreCompact`, no `PostToolUse`, no `SessionEnd` hook.** The first two
+existed only to drive the deleted judgment layer; the latter two belong to the
+supplementary ledger and are not part of this build.
+
+---
+
+## Supplementary features — do not build unless the trigger fires
+
+Both of these were core in earlier drafts and were demoted deliberately. They are
+specified here so the option stays open, **not** as part of this build. Each states the
+condition that would justify it. **Absent that condition, leaving it unbuilt is the
+correct outcome, not a shortcut** — report it as "not needed" rather than building it
+to be thorough.
+
+### S1. Status note (`.journal/HEAD.md`)
+
+**What it would be:** a few lines — goal, blocked, next, review — printed by the
+`SessionStart` hook so a new session and I both start oriented at zero token cost.
+
+**Why it is not core:** v2 had a cheap model keeping it current. That writer is deleted,
+so nothing would keep it accurate. A stale note injected into context at every session
+start is *worse than no note* — it is a confident, wrong orientation that both I and the
+agent will act on. An unmaintained status file is a liability, not a neutral extra.
+
+**Build only if** I find myself repeatedly starting fresh sessions that need
+cross-session context, and `qqna` is too heavy for that particular need.
+
+**If built, build it in this shape — do not build the hand-maintained version:**
+
+- **One hand-written line: `goal:`.** I write it once when I kick off a task. It does
+  not rot, because the goal is the goal for the whole run.
+- **Everything else generated mechanically** at `SessionStart` from the previous
+  session's transcript tail: its last assistant text block (truncated) plus the last
+  few tool calls. Zero tokens, no writer, cannot go stale — it is a direct quote of what
+  actually happened.
+
+Keep any write to it atomic (`mktemp` + `mv`) so it can never be appended to.
+
+### S2. Tool-call ledger (`.journal/ledger.tsv`)
+
+**What it would be:** `PostToolUse` + `PostToolUseFailure` hooks appending
+`ts | tool | path | ok|fail` per tool call, plus a `SessionEnd` line. Zero tokens.
+
+**Why it is not core:** the transcript already records every tool call and its outcome,
+so this is a second copy of data I already have — and two sources of truth that can
+disagree is a defect to design out, not a feature to add.
+
+**Build only if** one of these is true — verify, do not assume:
+
+1. **`PostToolUse` hooks fire for tool calls made inside subagents.** If they do, the
+   ledger becomes the only *complete, single-file* index of a delegating run, which is
+   real value given that subagent work otherwise hides in separate transcripts. **This
+   is the deciding question — answer it explicitly and report the answer either way.**
+2. I start needing a durable record that outlives transcript retention (transcripts are
+   cleaned up on a retention period; a file in the repo is not).
+
+**If built:** keep it minimal, fast, and non-blocking (single-line appends under
+PIPE_BUF are atomic; no locking). `qqna` must continue to treat the **transcript** as
+the source of truth and the ledger only as a cross-check — do not make any core output
+depend on it.
 
 ---
 
@@ -405,6 +447,8 @@ as a hand-edited file may be deleted entirely.
 - **qqna on Haiku.** 200K context cannot hold the seed.
 - **A model-compressed seed.** Lossy step, cents-scale problem.
 - **Any qqna write path into the repo.**
+- **Building the supplementary features "while we're here."** Their triggers are
+  conditions to be checked, not boxes to tick.
 - **qqna speculating about intent.** If the record doesn't say why, the answer is "the
   record doesn't say." A plausible invented rationale is the most dangerous output this
   system can produce.
@@ -413,7 +457,7 @@ as a hand-edited file may be deleted entirely.
 
 ## Cost model — state this honestly in the README
 
-- **Tier 0 (`cat HEAD.md`)**: free.
+- **Glance**: free (`git log`, the ledger or status note if ever built — no model).
 - **qqna cold seed**: one Sonnet load. At the measured range, roughly $0.10–$0.80
   depending on session size.
 - **Follow-ups are cheap only inside the cache window.** Every turn resends the whole
@@ -435,8 +479,8 @@ as a hand-edited file may be deleted entirely.
   multi-question check-in collapses from N cold reads to **one**. This is why batching
   the verdict into a single message matters.
 - **Decision rule worth documenting:** if qqna reveals a large pivot, killing terminal 1
-  and starting a fresh session seeded from `HEAD.md` is often cheaper than resuming the
-  old one. This is the main reason HEAD survives into v3.
+  and starting a fresh session seeded from a short hand-written brief is often cheaper
+  than resuming the old one.
 - **Pricing note:** Sonnet 5's introductory input rate ($2/M) expires **2026-08-31**,
   after which it is $3/M — recompute any figures in the README after that date. I am on
   Bedrock, so absolute figures differ from first-party rates; the ratios hold.
@@ -465,17 +509,19 @@ as a hand-edited file may be deleted entirely.
    appears in `qqna-unclaimed` (this fails with a bare `git diff --name-only`).
 5c. **Seed hygiene:** on a transcript containing a pasted image, show the image is
    stubbed and report seed size with and without the fix.
-5d. **Subagents:** run a session that spawns a subagent, then show whether qqna's seed
-   accounts for the subagent's work, and whether the ledger captured its tool calls.
+5d. **Subagents:** run a session that spawns a subagent and show whether qqna's seed
+   accounts for the subagent's work. **Separately, answer the S2 trigger question:** do
+   `PostToolUse` hooks fire for tool calls made inside a subagent? Report the answer —
+   it decides whether the ledger is ever worth building.
 5e. **Fallback isolation:** run qqna twice from a non-project directory and confirm the
    second run resolves to the work session, **not** to the first qqna session.
 6. **No contamination:** confirm qqna's own transcript does **not** land in the project's
-   transcript directory, and that running qqna does not add rows to `ledger.tsv`.
+   transcript directory, and that running qqna leaves no trace in the work repo.
 7. **Incremental refresh:** run `qqna-delta` twice; show the second call returns only
    new activity and that the offset advanced.
 8. **tmux binding:** `prefix + q` opens a pane in the correct cwd and qqna self-resolves.
-9. **Interrupt survival:** Ctrl+C the main session; confirm the SessionEnd stamp landed
-   in the ledger and that qqna still reconstructs usable state.
+9. **Interrupt survival:** Ctrl+C the main session and confirm qqna still reconstructs
+   usable state from the transcript plus `git diff`.
 
 ## Report these explicitly when you hand off
 
@@ -488,10 +534,14 @@ as a hand-edited file may be deleted entirely.
 
 ## Deliverables
 
-`qqna` + `qqna-delta` + `qqna-unclaimed` + the ledger hook script, a `.tmux.conf`
-fragment, a `settings.json` hooks fragment (match how this machine's config is
-organized), and a README covering the migration from my existing journal and the cost
-model above.
+**Core (build this):** `qqna` + `qqna-delta` + `qqna-unclaimed` +
+`scripts/journal-reset.sh`, a `.tmux.conf` fragment, a `settings.json` fragment for the
+single `SessionStart` base_sha hook (match how this machine's config is organized), and
+a README covering the migration from my existing journal and the cost model above.
+
+**Supplementary (do not build):** the README should note S1 and S2 exist as documented
+options with their trigger conditions, so future-me knows they were considered and
+deliberately deferred.
 
 Ask me before making any decision that would discard existing content or require a
 change to how I invoke Claude Code.
@@ -514,7 +564,7 @@ change to how I invoke Claude Code.
 | (absent) | **Do not fork/resume the live session** | Interleaved transcript writes corrupt the main session |
 | (absent) | **Scratch-dir isolation for qqna** | Otherwise qqna's transcript breaks newest-mtime discovery |
 | (absent) | **Incremental delta refresh** | Refresh cost ∝ new work, not total session size |
-| Kept: ledger, HEAD, base_sha, unclaimed-changes | **Kept** | The mechanical anchors were always the sound part |
+| Kept: ledger, HEAD, base_sha, unclaimed-changes | **base_sha + unclaimed-changes kept as core; ledger and HEAD demoted to supplementary** | Only the anchor is load-bearing; the other two duplicate the transcript or rot without a writer (see Supplementary) |
 
 ### v3 adversarial pass (findings from trying to break v3)
 
