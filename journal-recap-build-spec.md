@@ -101,8 +101,15 @@ in a scratch directory to answer my questions. Takes **no arguments**.
 
 **2. `.journal/ledger.tsv` — the mechanical index.** `PostToolUse` +
 `PostToolUseFailure` command hooks append one line per tool call:
-`ts | tool | path | ok|fail`. Zero tokens. Survives crashes. Its job is to be
-*complete*, including failures the transcript narration may gloss over.
+`ts | tool | path | ok|fail`. Zero tokens. Survives crashes.
+
+**Be honest about its value before building it.** The transcript already records every
+tool call and its outcome, so the ledger is largely redundant — it earns its place only
+if it captures something the parent transcript does not. **Verify one thing first: do
+`PostToolUse` hooks fire for tool calls made inside subagents?** If yes, the ledger is
+the only *complete, single-file* index of a delegating run and is clearly worth it
+(see the subagent blind spot below). If no, it is a cheap crash-survival backstop and
+nothing more — keep it minimal and build no features on it.
 
 **3. `.journal/HEAD.md` — the zero-token glance.** Four lines: goal, blocked, next,
 review. Injected at `SessionStart`. Answers "where are we" without running anything.
@@ -128,6 +135,12 @@ The transcript replaces all of it.
 3. **Fallback — required, not optional.** If the encoded directory does not exist, or
    contains no `.jsonl`, do **not** fail. Scan every `~/.claude/projects/*/` for the
    newest transcript across all repos, use it, and say loudly which repo it resolved to.
+   **Exclude qqna's own scratch project directories from this scan.** qqna runs an
+   interactive session in a scratch dir, which creates its own
+   `~/.claude/projects/<encoded-scratch>/` entry — and that entry is, by construction,
+   the newest transcript on the system. Without an exclusion the fallback resolves to
+   the previous qqna session instead of the work session. Use a fixed, recognisable
+   scratch path prefix and filter it out explicitly.
    This is the common case when I press the tmux binding from a pane that isn't
    terminal 1 (see tmux section) — the tool should still do the useful thing.
 4. Print which session it picked, **which repo it belongs to**, its tool-call count, and
@@ -146,13 +159,29 @@ not build this in v1; note it in the README as the upgrade path.
 
 Read the transcript JSONL and emit a seed that **keeps verbatim**:
 
-- every assistant text message
-- every user turn
-- every tool call's **name and target** (not its result body)
+- every assistant **text** block
+- every user **text** turn
+- every tool call's **name and target** (not its input body — a `Write` call's input is
+  the whole file)
 - every error / failure
 
-and **drops** tool *result bodies* — file contents and command output — replacing each
-with a one-line stub (`<result: 4.2KB, ok>`).
+and **stubs or drops** everything else. **[verified — measured on a real 1.35MB
+transcript]** the bulk is not where v2 assumed:
+
+| Block | Share of file | Action |
+|---|---|---|
+| `user/image` (pasted screenshots, base64) | **44.1%** | **stub** — `<image, 290KB>` |
+| `assistant/thinking` | **10.0%** | **drop entirely** — see below, it is empty |
+| `attachment` (file contents attached to turns) | 6.5% | stub with path + size |
+| `assistant/tool_use` (inputs incl. full file bodies) | 4.5% | keep name + target only |
+| `user/tool_result` | 1.0% | stub — `<result: 4.2KB, ok>` |
+| `assistant/text` | **2.2%** | **keep verbatim** |
+| `user/text` | 5.6% | **keep verbatim** |
+
+**A naive "keep every user turn verbatim" rule is a bug**: on the measured session it
+would have carried 595KB of base64 screenshots into the seed, making it ~6.5× larger
+than a correct filter produces (704KB vs 109KB). Images and attachments live in *user*
+messages, not tool results, so the v2 rule missed them.
 
 Nothing is summarized. Nothing is compressed by a model. The only lossy step is
 omitting tool output, and that omission is **recoverable**: qqna has file access, so if
@@ -161,6 +190,51 @@ gets near-full accuracy at a fraction of the bytes.
 
 **Do not compress the seed with a model.** It adds a lossy step to solve a cents-scale
 problem.
+
+### What the record does NOT contain — design against this
+
+**[verified — measured] Extended-thinking blocks are present but empty.** On the
+measured session all 23 `thinking` blocks carried zero text while occupying 10% of the
+file: current models default to `display: "omitted"`, so the raw reasoning is never
+written to the transcript. Two consequences:
+
+1. **Drop thinking blocks from the seed.** They are pure overhead — signatures and
+   metadata with no content.
+2. **The reasoning behind a decision is recoverable only if the model said it out
+   loud.** If a choice was made silently in thinking and the visible text merely states
+   the conclusion, that "why" is *gone* — not compressed, not summarized, absent.
+
+This is the single most important honesty constraint in the system. **State it as a
+hard rule in qqna's prompt:**
+
+> The record contains what was said and done, not what was thought. If it does not
+> state why a choice was made, say "the record doesn't say" and cite what it does show.
+> Never infer or reconstruct motive.
+
+Without this rule qqna will fluently invent rationales, which is strictly worse than
+admitting ignorance — a confident wrong "why" is exactly what would make me approve
+something I should have questioned.
+
+**Investigate before building:** check whether this Claude Code version can be
+configured to persist summarized thinking. If it can, enabling it materially increases
+what qqna can answer, and is worth doing. Report what you find either way.
+
+### Subagents — a real blind spot
+
+**[verified]** Subagent work is written to **separate transcripts** at
+`~/.claude/projects/<encoded>/<session-id>/subagents/agent-*.jsonl`; the parent
+transcript contained **zero** sidechain rows. From the main transcript alone, an hour
+of delegated work looks like "spawned agent → received report."
+
+For a long-horizon autonomous run this is the difference between seeing the work and
+seeing a receipt — and files edited by a subagent surface in unclaimed-changes with
+nothing in the seed to explain them.
+
+**Required:** enumerate the `subagents/` directory for the resolved session, apply the
+same filter to each agent transcript, and either fold them into the seed (labelled by
+agent) or list them in the seed header with their paths so qqna can read one on demand.
+At minimum the seed must say how many subagent transcripts exist and where — never
+silently omit them.
 
 ### Sizing expectations — do not assume a fixed ratio
 
@@ -189,15 +263,24 @@ Launch an **interactive** `claude --model sonnet`:
 - **`--settings '{"disableAllHooks": true}'`** — my user-level hooks
   (`~/.claude/settings.json`) would otherwise fire inside qqna. Required
   **[verified: no env-var alternative exists]**.
-- **Read-only.** Deny `Write` / `Edit` / `NotebookEdit` via settings deny rules, and
-  restrict Bash to the read-only helpers below. qqna must be structurally incapable of
-  modifying the repo. Verify this, don't assert it.
+- **Read-only — and Bash is the hole, not the edit tools.** Denying `Write` / `Edit` /
+  `NotebookEdit` is necessary and *not sufficient*: a shell is a write tool. Bash must
+  be restricted to an **allowlist** of the specific helper commands (`qqna-delta`,
+  `qqna-unclaimed`, `git log|diff|status|show`) rather than merely deny-listing edits.
+  This matters because the seed contains untrusted content the main session ingested
+  (web pages, dependency files, error text); qqna is an agent reading attacker-
+  influenceable text with a shell attached. Treat it as such. Verify by attempting a
+  write from inside qqna and showing the refusal.
 
 ### Incremental refresh — do not relaunch
 
 The transcript is append-only, so refreshing must cost only the *new* work.
 
 - Record a byte offset per session in `.journal/qqna/<session-id>.offset`.
+  **Guard the offset**: (a) only ever advance to the last **complete** line — the file
+  is being appended to live, so the tail can be a torn, unparseable fragment; (b) if the
+  file has *shrunk* below the stored offset, or the stored session id no longer matches,
+  discard the offset and re-seed rather than reading garbage.
 - Ship a helper `qqna-delta` that prints filtered activity from the stored offset to
   EOF, then advances the offset.
 - Tell qqna in its seed header: *"To see what has happened since, run `qqna-delta`."*
@@ -211,8 +294,23 @@ grows as the run gets longer.
 These are the three things I would otherwise always waste questions on:
 
 1. **Freshness** — session id, tool-call count, age of last transcript entry.
-2. **Unclaimed changes** — `git diff --name-only $(cat .journal/base_sha)` minus every
-   path mentioned anywhere in the seed. Ship this as `qqna-unclaimed`.
+2. **Unclaimed changes** — changed paths minus every path mentioned anywhere in the
+   seed. Ship this as `qqna-unclaimed`.
+
+   **[verified] `git diff --name-only` alone is wrong — it omits untracked files.** A
+   brand-new file the agent created and never mentioned is both the most likely thing
+   to be missed and the most important thing to catch, and the naive command silently
+   drops it. Use the union:
+
+   ```sh
+   { git diff --name-only "$(cat .journal/base_sha)"
+     git ls-files --others --exclude-standard; } | sort -u
+   ```
+
+   Normalise paths before subtracting: the seed may refer to a file as an absolute
+   path, a repo-relative path, or a bare basename. Compare on repo-relative form, and
+   when in doubt report the file as unclaimed — a false positive costs me five seconds,
+   a false negative is the failure this whole feature exists to prevent.
 3. **Failure tail** — recent `fail` rows from `ledger.tsv`.
 
 **#2 is the accuracy backstop and the highest-value output in the whole system.** A
@@ -276,9 +374,18 @@ That is the entire hook surface. **No `Stop` hook. No `PreCompact` hook.** Both 
 in v2 solely to drive the deleted judgment layer.
 
 `HEAD.md` is maintained by me (or by the main session as a normal task), not by a
-hooked model. If it goes stale, qqna is the ground truth and HEAD is only the glance.
-Keep HEAD writes atomic (`mktemp` + `mv`) wherever they happen, so it can never be
-appended to.
+hooked model. Keep HEAD writes atomic (`mktemp` + `mv`) so it can never be appended to.
+
+**Open problem — flag this, do not paper over it.** v2 had a model keeping HEAD fresh;
+v3 deleted that writer and put nothing in its place, so **nothing now keeps HEAD
+accurate**. A stale HEAD injected at `SessionStart` is worse than no HEAD: it is a
+confident, wrong orientation for both me and the agent.
+
+Propose the mechanical alternative and let me choose: at `SessionStart`, instead of
+printing a hand-maintained file, print **the tail of the previous session's transcript**
+— its last assistant text block (truncated) plus the last few ledger rows. That is
+zero-token, always accurate, needs no writer, and cannot go stale. If that works, HEAD
+as a hand-edited file may be deleted entirely.
 
 ---
 
@@ -298,6 +405,9 @@ appended to.
 - **qqna on Haiku.** 200K context cannot hold the seed.
 - **A model-compressed seed.** Lossy step, cents-scale problem.
 - **Any qqna write path into the repo.**
+- **qqna speculating about intent.** If the record doesn't say why, the answer is "the
+  record doesn't say." A plausible invented rationale is the most dangerous output this
+  system can produce.
 
 ---
 
@@ -305,8 +415,19 @@ appended to.
 
 - **Tier 0 (`cat HEAD.md`)**: free.
 - **qqna cold seed**: one Sonnet load. At the measured range, roughly $0.10–$0.80
-  depending on session size. Each follow-up question inside the open pane is a fraction
-  of that.
+  depending on session size.
+- **Follow-ups are cheap only inside the cache window.** Every turn resends the whole
+  context; it is discounted only on a prompt-cache hit. Questions asked back-to-back are
+  a fraction of the seed cost. A question asked after a long idle gap is **not** — it
+  re-reads the seed *plus* all accumulated Q&A, which is strictly more than a fresh
+  seed would cost.
+  **Measure the effective cache TTL before recommending a pane lifetime**, and set the
+  README's advice by the result:
+  - long TTL (~1hr): one pane for the whole run is fine, refresh in place via `qqna-delta`.
+  - short TTL (~5min): **one pane per check-in, closed afterwards.** A long-lived pane
+    silently gets *more* expensive as its history grows.
+  Do not assert either without measuring — this determines whether the headline
+  workflow is "leave it open" or "fire it per check-in".
 - **The verdict is not free.** Returning to terminal 1 and typing my decision lands in
   a session whose cache has expired — one full uncached re-read at top-tier rates. qqna
   does not eliminate that; it changes *when and how often* I pay it. The real wins:
@@ -338,7 +459,16 @@ appended to.
    bodies are stubbed.
 4. **Unclaimed changes:** edit a file the session never touched, then confirm it appears
    in `qqna-unclaimed` output.
-5. **Read-only:** attempt a write from inside qqna and show it being refused.
+5. **Read-only:** attempt a write from inside qqna and show it being refused —
+   including via **Bash**, not just via `Write`/`Edit`.
+5b. **Untracked files:** create a new file the session never mentioned and confirm it
+   appears in `qqna-unclaimed` (this fails with a bare `git diff --name-only`).
+5c. **Seed hygiene:** on a transcript containing a pasted image, show the image is
+   stubbed and report seed size with and without the fix.
+5d. **Subagents:** run a session that spawns a subagent, then show whether qqna's seed
+   accounts for the subagent's work, and whether the ledger captured its tool calls.
+5e. **Fallback isolation:** run qqna twice from a non-project directory and confirm the
+   second run resolves to the work session, **not** to the first qqna session.
 6. **No contamination:** confirm qqna's own transcript does **not** land in the project's
    transcript directory, and that running qqna does not add rows to `ledger.tsv`.
 7. **Incremental refresh:** run `qqna-delta` twice; show the second call returns only
@@ -385,6 +515,21 @@ change to how I invoke Claude Code.
 | (absent) | **Scratch-dir isolation for qqna** | Otherwise qqna's transcript breaks newest-mtime discovery |
 | (absent) | **Incremental delta refresh** | Refresh cost ∝ new work, not total session size |
 | Kept: ledger, HEAD, base_sha, unclaimed-changes | **Kept** | The mechanical anchors were always the sound part |
+
+### v3 adversarial pass (findings from trying to break v3)
+
+| Finding | Severity | Resolution |
+|---|---|---|
+| Reasoning is absent — thinking blocks are 10% of bytes and **100% empty** (`display: omitted`) | **critical** | qqna must never infer motive; drop thinking blocks from the seed; investigate persisting summarized thinking |
+| Seed filter kept pasted images verbatim — **44% of the measured transcript** was 2 screenshots | **critical** | stub images and attachments; correct filter yields 109KB vs 704KB naive |
+| `git diff --name-only` **omits untracked files** — the backstop missed brand-new files | **critical** | union with `git ls-files --others --exclude-standard` |
+| Global discovery fallback would resolve to **qqna's own scratch session** (newest by construction) | **critical** | exclude the scratch path prefix from the scan |
+| Subagent work lives in **separate transcripts**; parent had zero sidechain rows | serious | enumerate and fold in `subagents/*.jsonl`, or list them for on-demand reading |
+| "Read-only" enforced by denying Write/Edit — **Bash is the hole** | serious | allowlist specific helper commands; qqna is an agent reading untrusted text with a shell |
+| Long-lived pane may cost *more* than re-seeding once cache TTL expires | serious | measure TTL; pane lifetime advice follows from it |
+| Nothing keeps `HEAD.md` fresh after v3 deleted the writer | moderate | propose mechanical alternative: inject previous transcript tail + ledger tail |
+| Byte offsets break on torn tail / file shrink | moderate | advance only to last complete line; re-seed on shrink or id mismatch |
+| Ledger is largely redundant with the transcript | moderate | verify whether PostToolUse fires in subagents; that decides if it is load-bearing |
 
 ### v1 → v2 (corrections that still stand)
 
