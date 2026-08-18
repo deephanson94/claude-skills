@@ -125,8 +125,16 @@ The transcript replaces all of it.
 2. In `~/.claude/projects/<encoded>/`, pick the `.jsonl` with the newest mtime.
    Because the transcript updates continuously **[verified]**, newest-mtime reliably
    means "most recently active session in this repo."
-3. Print which session it picked, its tool-call count, and **how old the last entry
-   is**, so I always know how stale I am.
+3. **Fallback — required, not optional.** If the encoded directory does not exist, or
+   contains no `.jsonl`, do **not** fail. Scan every `~/.claude/projects/*/` for the
+   newest transcript across all repos, use it, and say loudly which repo it resolved to.
+   This is the common case when I press the tmux binding from a pane that isn't
+   terminal 1 (see tmux section) — the tool should still do the useful thing.
+4. Print which session it picked, **which repo it belongs to**, its tool-call count, and
+   **how old the last entry is**. The repo name is what makes a wrong pick instantly
+   visible, so print it every time, not just on fallback.
+5. Accept an optional explicit path argument (`qqna /path/to/repo`) as the manual
+   override. Never require it.
 
 **Optional hardening (build only if step 2 proves ambiguous in practice):** a
 `SessionStart` hook writes `session_id` + `transcript_path` **[verified: both are in
@@ -226,9 +234,21 @@ bind-key q split-window -h -c "#{pane_current_path}" 'qqna'
 ```
 
 `prefix + q` splits a pane that inherits the source pane's cwd — which is all `qqna`
-needs. **[verified: `-c "#{pane_current_path}"` correctly propagates the source pane's
-cwd.]** Zero arguments typed, zero tokens spent in terminal 1, and the main session
+needs. Zero arguments typed, zero tokens spent in terminal 1, and the main session
 never learns it happened.
+
+**[verified — measured against the real workflow]** The sequence *start tmux in `$HOME`
+→ `cd` into the repo → run `claude` → split* propagates correctly. tmux tracks the
+`cd` (`pane_current_path` moved from `/root` to `/home/user/claude-skills`), still
+reports it correctly while a long-running foreground process occupies the pane, and the
+split inherits it. The mechanism reads **the shell's** cwd, not the claude process's, so
+nothing Claude Code does to its own working directory during the session can move it.
+
+**Known limitation — this is why the discovery fallback above is mandatory.** The
+binding resolves the cwd of *whichever pane the key was pressed in*. Pressing it from
+terminal 1's pane is correct; pressing it from an unrelated pane sitting in `$HOME`
+resolves to the wrong place. Handle it by falling back to a global newest-transcript
+scan and printing the repo, not by failing.
 
 **[verified] Do not try to pass `#{pane_id}` as a command argument** —
 `split-window ... "qqna #{pane_id}"` arrives **empty**; tmux expands formats in `-c`
@@ -306,6 +326,9 @@ appended to.
 
 1. **Discovery with zero args:** from the project dir, `qqna` finds the correct live
    session. Show the resolved path and the encoding step.
+1b. **Discovery fallback:** run `qqna` from `$HOME` (a directory with no matching
+   project dir) and confirm it still resolves to the most recently active session,
+   names the repo it picked, and does not error.
 2. **Liveness:** while a session is mid-turn, show that the seed contains work from the
    current turn, and report the measured age of the last transcript entry. (Expect
    seconds. If you measure turn-scale lag, say so — that contradicts my measurement and
