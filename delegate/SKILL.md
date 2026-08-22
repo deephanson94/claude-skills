@@ -60,9 +60,14 @@ A plan the worker cannot misread:
 Vague plans are the main failure mode. Fan-out amplifies vagueness.
 
 **3. Run the worker. Always backgrounded.**
+
+Scripts live beside this file, not in the project you are working on:
+```sh
+SK=~/.claude/skills/delegate/scripts   # this skill's own directory
+```
 ```sh
 N=1   # round number; round 2 uses out/r2, and so on
-nohup bash scripts/worker.sh <backend> <run>/plan.md <run>/repo <run>/out/r$N \
+nohup bash "$SK/worker.sh" <backend> <run>/plan.md <run>/repo <run>/out/r$N \
   > <run>/launch.log 2>&1 < /dev/null &
 ```
 Implementation turns routinely exceed the 10-minute Bash cap. Poll for
@@ -72,9 +77,10 @@ Implementation turns routinely exceed the 10-minute Bash cap. Poll for
 To watch it work, open a read-only pane right after the `nohup`:
 ```sh
 tmux split-window -d -v -l 15 \
-  "bash $PWD/scripts/watch.sh $PWD/<run> <backend>; read -r -t 600 _"
+  "bash $SK/watch.sh $PWD/<run> <backend>; read -r -t 600 _"
 ```
-Absolute paths: a new pane starts in the tmux *session's* cwd, not yours. The trailing
+Absolute paths for both the script and the run dir: a new pane starts in the tmux
+*session's* cwd, not yours. The trailing
 `read` keeps the pane alive after the viewer exits — `remain-on-exit` is off by default,
 so otherwise the pane vanishes with the `done:` line still on it.
 `-d` keeps focus. It exits on its own when `result.json` appears. It is strictly
