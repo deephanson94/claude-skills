@@ -13,7 +13,13 @@
 set -uo pipefail
 
 RUN="${1:?usage: watch.sh <run-dir> [backend]}"
-RAW="$RUN/out/raw.json"; RESULT="$RUN/out/result.json"
+# The out-dir is per round (out/r1, out/r2, ...) — worker.sh refuses to reuse one, so
+# `$RUN/out/raw.json` does not exist and following it would hang until the pane's read
+# timeout. Take the highest-numbered round, which is the one just launched; fall back to
+# a flat out/ for a run that predates the per-round layout.
+OUTDIR=$(ls -d "$RUN"/out/r[0-9]* 2>/dev/null | sort -V | tail -1)
+OUTDIR="${OUTDIR:-$RUN/out}"
+RAW="$OUTDIR/raw.json"; RESULT="$OUTDIR/result.json"
 REPO=$(cd "$RUN/repo" 2>/dev/null && pwd -P) || REPO="$RUN/repo"
 
 BACKEND="${2:-}"

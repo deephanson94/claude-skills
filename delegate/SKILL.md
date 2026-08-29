@@ -18,6 +18,26 @@ You never trust the worker's self-report.
 
 Default to `opencode` for mechanical work, `agy` when the task needs fan-out.
 
+## Two modes — pick one before you start
+
+Only Claude's tokens are worth optimising; the worker's own spend is free. Reviewing a
+finished diff costs a small fraction of writing the same code, and the *driving* — writing
+the plan, polling, re-reading the tree between rounds — sits between the two. So the only
+real question is how much of the driving Claude does.
+
+| mode | Claude does | use when |
+|---|---|---|
+| **driven** | the whole loop below, polling included | the user is away, or you expect the retry path to run |
+| **hand-off** | writes `plan.md`, then stops. The user launches the worker and watches it. Claude comes back for steps 4 and 5. | the user is at the keyboard |
+
+Hand-off drops the polling and the between-round tree re-reads, which is most of the
+driving overhead. It does not *remove* the retry path — it moves it to the user, who now
+owns the reset-and-fresh-session dance by hand. That makes it the wrong choice for a task
+you expect to need a round 2.
+
+**Steps 4 and 5 are unconditional in both modes.** They are where the value is. Skipping
+the plan is a real trade; skipping the gate or the review is not.
+
 ## Layout — get this right or the retry path eats itself
 
 ```
@@ -159,9 +179,36 @@ NaN, Infinity, empty, negative, backwards time.
 
 Write findings to `<run>/REVIEW.md`. Report test counts, diff size, and what you'd change.
 
+**6. Record what produced the diff.**
+`runs/` is scratch, so the answer to "which agent wrote this?" has to leave it. `result.json`
+already carries `backend`, `model`, `base_sha` and `session_id`:
+```sh
+jq -r '"Delegated-To: \(.model) (\(.backend))\nDelegated-Base: \(.base_sha)"' <run>/out/r$N/result.json
+# Delegated-To: gemini-3.1-pro-high (agy)
+# Delegated-Base: 4f2a1c…
+```
+Put those in the commit trailer or the PR body — somewhere that outlives the run dir. Two
+agents committing under the same git identity are otherwise indistinguishable downstream,
+and prose style is not attribution: a worker's summary can read exactly like your own.
+Without this line, "how well does delegation actually work?" stops being answerable the
+moment you delete `runs/`.
+
 ## Rules
 
+- Never run the backend CLI by hand, in either mode — always go through `worker.sh`. A
+  hand-run worker writes no `result.json`, so the containment check and every `base_sha`
+  reset have nothing to read; it has no watchdog, so a hung run never terminates; and it
+  gets none of the sandbox env vars, so `--auto` installs globally. `watch.sh` tails
+  `out/raw.json`, so it cannot watch a hand-run worker either — the live view *requires*
+  `worker.sh`.
 - Never let the worker touch test files or config. Check the diff for it.
+  One sanctioned exception, if all four hold: the repo has a mutation harness; `plan.md`
+  names one mutant per guard **up front**; the worker may only **add** test files, never
+  modify an existing test, the harness config, or the mutation config; and you run the
+  mutation suite yourself in step 4. That converts "did it write real tests?" from a
+  judgement into a command. Naming the mutants afterwards does not count — the worker will
+  pick mutants its own tests already catch. And mutation proves the tests *bite*, not that
+  the spec is right: step 5 still reviews against the user's request.
 - Never accept a worker's "all tests pass" without running them.
 - Watch for side effects outside the repo — package installs, global config writes.
 - Report what you delegated and what you verified. Do not present a worker's output as your own review.
