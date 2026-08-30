@@ -5,7 +5,8 @@
 #
 # backend: agy | opencode | claude
 # Writes <out-dir>/result.json (normalized) and <out-dir>/raw.json (backend's own output).
-# Normalized: {backend, status, session_id, text, error, exit_code}
+# Normalized: {backend, model, status, session_id, text, error, exit_code}
+#             plus repo_changed and base_sha, stamped after the run.
 #
 # <plan-file> and <out-dir> MUST live OUTSIDE <repo-dir>. The retry path resets the
 # repo with `git checkout . && git clean -fd`, which would otherwise delete the plan
@@ -29,6 +30,15 @@ AGY_MODEL="${AGY_MODEL:-gemini-3.1-pro-high}"
 OC_MODEL="${OC_MODEL:-opencode/muse-spark-1.2-contributor-free}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-}"
 TIMEOUT_SECS="${WORKER_TIMEOUT_SECS:-1200}"
+# Which model actually ran. Recorded in result.json so a finished run can still answer
+# "who wrote this?" months later — the run dir is scratch, but this line travels into the
+# commit trailer. Resolved here, before the sentinel, so a worker that dies early still
+# reports it.
+case "$BACKEND" in
+  agy)      MODEL="$AGY_MODEL" ;;
+  opencode) MODEL="$OC_MODEL" ;;
+  claude)   MODEL="${CLAUDE_MODEL:-<cli default>}" ;;
+esac
 MAX_PLAN_BYTES="${MAX_PLAN_BYTES:-200000}"
 
 [ -f "$PLAN" ] || { echo "plan not found: $PLAN" >&2; exit 2; }
@@ -61,8 +71,8 @@ rm -f "$RESULT" "$RAW" "$OUT/stderr.log"
 # waiting on result.json terminates instead of hanging forever.
 sentinel() {
   [ -s "$RESULT" ] && return 0
-  jq -n --arg b "$BACKEND" --arg s "${1:-DIED}" \
-    '{backend:$b, status:$s, session_id:"", text:"", error:"worker exited without a result", exit_code:124}' \
+  jq -n --arg b "$BACKEND" --arg m "$MODEL" --arg s "${1:-DIED}" \
+    '{backend:$b, model:$m, status:$s, session_id:"", text:"", error:"worker exited without a result", exit_code:124}' \
     > "$RESULT" 2>/dev/null
 }
 trap 'kill ${CHILD:-} ${WATCHDOG:-} 2>/dev/null; [ -n "${CHILD:-}" ] && pkill -P "$CHILD" 2>/dev/null; sentinel DIED' EXIT
@@ -152,13 +162,16 @@ esac
 CHANGED=$( { [ -n "$BASE" ] && git -C "$REPO" diff --name-only "$BASE" 2>/dev/null
              git -C "$REPO" ls-files --others --exclude-standard 2>/dev/null; } \
            | sort -u | grep -vc '^$' | tr -d ' ')
+# One stamping point for all three backends: the normalizers above differ per backend,
+# but provenance and containment are the same three fields every time.
 if [ -s "$RESULT" ]; then
-  jq --argjson n "${CHANGED:-0}" --arg b "${BASE:-}" '.repo_changed=$n | .base_sha=$b' \
+  jq --argjson n "${CHANGED:-0}" --arg b "${BASE:-}" --arg m "$MODEL" \
+    '.repo_changed=$n | .base_sha=$b | .model=$m' \
     "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
 fi
 
-[ -s "$RESULT" ] || jq -n --arg b "$BACKEND" --argjson c "$CODE" \
-  '{backend:$b, status:"UNPARSEABLE", session_id:"", text:"", error:"see raw.json", exit_code:$c}' > "$RESULT"
+[ -s "$RESULT" ] || jq -n --arg b "$BACKEND" --arg m "$MODEL" --argjson c "$CODE" \
+  '{backend:$b, model:$m, status:"UNPARSEABLE", session_id:"", text:"", error:"see raw.json", exit_code:$c}' > "$RESULT"
 
 if [ "$TIMED_OUT" = "yes" ]; then
   jq '.status="TIMEOUT" | .error="killed by watchdog after '"$TIMEOUT_SECS"'s"' "$RESULT" > "$RESULT.tmp" \
@@ -166,5 +179,5 @@ if [ "$TIMED_OUT" = "yes" ]; then
 fi
 
 trap - EXIT
-jq -r '"[\(.backend)] status=\(.status) exit=\(.exit_code) session=\(.session_id)"' "$RESULT"
+jq -r '"[\(.backend)] model=\(.model) status=\(.status) exit=\(.exit_code) session=\(.session_id)"' "$RESULT"
 exit "$CODE"
